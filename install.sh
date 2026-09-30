@@ -195,8 +195,12 @@ if [[ -z "$TOKEN" ]]; then
     prompt TOKEN "面板 Token (输入不回显)" "" 1
 fi
 if [[ -z "$TOKEN" ]]; then log_err "token 不能为空"; exit 1; fi
-# 面板地址去掉末尾斜杠
+# 面板地址规范化：去掉末尾斜杠；没写 scheme 的自动补 https://
 PANEL_URL="${PANEL_URL%/}"
+if [[ ! "$PANEL_URL" =~ :// ]]; then
+    PANEL_URL="https://${PANEL_URL}"
+    log_warn "面板地址自动补全为 ${PANEL_URL}"
+fi
 
 # ---------------- 8. 内存配置选择 ----------------
 # 建议值: 可用内存的 40%，保底 24MiB
