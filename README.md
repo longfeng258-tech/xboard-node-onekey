@@ -15,8 +15,11 @@ xboard-node（machine 模式）一键部署脚本。
 
 ## 一键安装
 
+仓库是私有的，下载脚本需要一个 GitHub token（建议用 Fine-grained token，只给本仓库 Contents 的 Read 权限）：
+
 ```bash
-curl -fsSL https://raw.githubusercontent.com/longfeng258-tech/xboard-node-onekey/main/install.sh | sudo bash
+export GH_TOKEN=<你的token>
+curl -fsSL -H "Authorization: Bearer ${GH_TOKEN}" https://raw.githubusercontent.com/longfeng258-tech/xboard-node-onekey/main/install.sh | sudo bash
 ```
 
 按提示输入面板地址、`machine_id`、`token`（输入不回显），然后选择内存配置即可。
@@ -24,7 +27,7 @@ curl -fsSL https://raw.githubusercontent.com/longfeng258-tech/xboard-node-onekey
 ## 参数（免交互）
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/longfeng258-tech/xboard-node-onekey/main/install.sh \
+curl -fsSL -H "Authorization: Bearer ${GH_TOKEN}" https://raw.githubusercontent.com/longfeng258-tech/xboard-node-onekey/main/install.sh \
   | sudo bash -s -- --panel https://panel.example.com --machine-id 3 --token <token> --mem-limit 48 -y
 ```
 
