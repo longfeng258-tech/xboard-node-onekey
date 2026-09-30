@@ -1,0 +1,355 @@
+"""One offline regression check: parser, memory limits, auth and service rendering.
+
+Run on Linux: python3 tests/check.py. No root, account or network needed.
+Optional XBOARD_TEST_BINARIES points at verified official amd64 binaries.
+"""
+import hashlib
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+import json
+import os
+import pty
+from pathlib import Path
+import shlex
+import select
+import subprocess
+import socket
+import socketserver
+import ssl
+import tempfile
+import threading
+import time
+import uuid
+
+SCRIPT = Path(__file__).resolve().parents[1] / 'install.sh'
+SHELL = shlex.split(os.environ.get('TEST_SHELL', 'sh'))
+BASE = f'XBOARD_INSTALL_LIBRARY=1; . {shlex.quote(str(SCRIPT))}; '
+COMMAND = (
+    "curl -fsSL https://raw.githubusercontent.com/cedar2025/xboard-node/dev/install.sh "
+    "| sudo bash -s -- --mode machine --panel 'https://panel.example.com/' "
+    "--token 'example-machine-token' --machine-id 8"
+)
+
+
+def run(code, stdin='', success=True):
+    p = subprocess.run(SHELL + ['-c', BASE + code], input=stdin, text=True,
+                       capture_output=True, timeout=20)
+    if success:
+        assert p.returncode == 0, (code, p.stdout, p.stderr)
+    else:
+        assert p.returncode != 0, (code, p.stdout, p.stderr)
+    return p
+
+
+assert run('parse_command', COMMAND + '\n').stdout.splitlines() == [
+    'https://panel.example.com', 'example-machine-token', '8']
+assert run('parse_command', COMMAND.replace('| sudo', '|').replace("'", '"') + '\n').returncode == 0
+assert run('parse_command', COMMAND.replace('--machine-id 8', '--machine-id 42').replace(' --mode', '\t--mode') + '\n').stdout.endswith('42\n')
+for attack in [
+    COMMAND + '; touch /tmp/must-not-exist',
+    COMMAND + ' && false', COMMAND + ' | sh', COMMAND + ' --kernel xray',
+    COMMAND + ' --token duplicate', COMMAND + '\n' + COMMAND,
+    COMMAND.replace('example-machine-token', '$(touch /tmp/must-not-exist)'),
+    COMMAND.replace('example-machine-token', '`id`'),
+    COMMAND.replace('example-machine-token', 'x\\y'),
+    COMMAND.replace('example-machine-token', "x' --machine-id 99 '"),
+    COMMAND.replace('--machine-id 8', '--machine-id'),
+    COMMAND.replace('--machine-id 8', '--machine-id 0'),
+    COMMAND.replace('--machine-id 8', '--machine-id 99999999999'),
+    COMMAND.replace('--mode machine', '--mode node'),
+    COMMAND.replace('--token ', '--other '),
+    COMMAND.replace('https://panel.example.com/', 'http://panel.example.com/'),
+    COMMAND.replace('https://panel.example.com/', 'https://user@panel.example.com/'),
+    COMMAND.replace('https://panel.example.com/', 'https://panel.example.com/?x=1'),
+    COMMAND.replace('https://panel.example.com/', 'https://panel.example.com:99999/'),
+    COMMAND.replace('cedar2025/xboard-node', 'attacker/xboard-node'),
+    COMMAND[:-1] + "'", 'x' * 8193, '',
+]:
+    p = run('parse_command', attack + '\n', success=False)
+    assert not p.stdout, 'rejected command must not emit private fields'
+
+# A controlling terminal is required even when the installer stdin is a pipe.
+# Paste immediately after the prompt to catch echo-disable ordering regressions.
+pid, terminal = pty.fork()
+if pid == 0:
+    os.execvp(SHELL[0], SHELL + ['-c', BASE +
+              'MEMORY=64; read_private_command </dev/null; choose_options </dev/null; '
+              'printf "PRIVATE_OK:%s:%s\\n" "$MACHINE_ID" "$BUDGET"'])
+output = b''
+sent = False
+deadline = time.monotonic() + 10
+try:
+    while True:
+        assert time.monotonic() < deadline, output
+        readable, _, _ = select.select([terminal], [], [], 0.2)
+        if not readable:
+            continue
+        try:
+            chunk = os.read(terminal, 8192)
+        except OSError:
+            break
+        if not chunk:
+            break
+        output += chunk
+        if not sent and '输入隐藏'.encode() in output:
+            os.write(terminal, (COMMAND + '\n1\n2\n00000028\n').encode())
+            sent = True
+    _, status = os.waitpid(pid, 0)
+    assert status == 0 and b'PRIVATE_OK:8:28' in output, output
+    assert b'example-machine-token' not in output, 'terminal echoed private command'
+finally:
+    os.close(terminal)
+
+with tempfile.TemporaryDirectory(prefix='xboard-check-') as temp:
+    root = Path(temp)
+    proc = root / 'proc'
+    (proc / 'self').mkdir(parents=True)
+    cg = root / 'cg'
+    leaf = cg / 'slice' / 'child'
+    leaf.mkdir(parents=True)
+    (proc / 'meminfo').write_text('MemTotal: 2048000 kB\n')
+    (proc / 'self/cgroup').write_text('0::/slice/child\n')
+    (proc / 'self/mountinfo').write_text(f'29 23 0:26 / {cg} rw - cgroup2 cgroup rw\n')
+    (cg / 'memory.max').write_text('max\n')
+    (cg / 'slice/memory.max').write_text('67108864\n')
+    (leaf / 'memory.max').write_text('max\n')
+    assert run(f'effective_memory {shlex.quote(str(proc))}').stdout.strip() == '64'
+    (leaf / 'memory.max').write_text('128000000\n')
+    assert run(f'effective_memory {shlex.quote(str(proc))}').stdout.strip() == '64'
+    (cg / 'slice/memory.max').write_text('max\n')
+    assert run(f'effective_memory {shlex.quote(str(proc))}').stdout.strip() == '122'
+    # cgroup namespace can expose an ancestor limit only at its mount root.
+    (proc / 'self/cgroup').write_text('0::/../hidden\n')
+    (cg / 'memory.max').write_text('67108864\n')
+    assert run(f'effective_memory {shlex.quote(str(proc))}').stdout.strip() == '64'
+    # v1 unlimited sentinel must not masquerade as actual host RAM.
+    (proc / 'self/cgroup').write_text('3:memory:/slice/child\n')
+    (proc / 'self/mountinfo').write_text(f'29 23 0:26 / {cg} rw - cgroup cgroup rw,memory\n')
+    (cg / 'memory.limit_in_bytes').write_text('9223372036854771712\n')
+    (leaf / 'memory.limit_in_bytes').write_text('128000000\n')
+    assert run(f'effective_memory {shlex.quote(str(proc))}').stdout.strip() == '122'
+    for memory, expected in [(64, 28), (122, 48), (256, 102), (1024, 409)]:
+        assert run(f'recommended_budget {memory}').stdout.strip() == str(expected)
+
+    # Private JSON auth is stdin; curl argv never receives the token or redirects.
+    stage = root / 'stage'
+    stage.mkdir()
+    common = f'STAGE={shlex.quote(str(stage))}; PANEL=https://panel.example.com; TOKEN=example-machine-token; MACHINE_ID=8; '
+    fake_curl = '''curl() {
+        printf '%s\\n' "$@" >"$STAGE/argv";
+        cat >"$STAGE/body";
+        printf '%s' "$response" >"$STAGE/panel.json";
+        printf '%s' "$http_status";
+    }; '''
+    for response, http_status, valid in [
+        ('{"nodes":[]}', '200', True),
+        ('{"nodes":[{"id":1,"type":"vless"}]}', '200', True),
+        ('<html>login</html>', '200', False),
+        ('{"data":{"nodes":[]}}', '200', False),
+        ('{"nodes":[]}', '401', False),
+        ('{"nodes":[]}', '302', False),
+        ('{"nodes":[{"id":0,"type":"vless"}]}', '200', False),
+    ]:
+        code = common + fake_curl + f'response={shlex.quote(response)}; http_status={http_status}; check_panel'
+        p = run(code, success=valid)
+        assert 'example-machine-token' not in (stage / 'argv').read_text()
+        assert '--location' not in (stage / 'argv').read_text()
+        assert 'example-machine-token' not in p.stdout + p.stderr
+        assert (stage / 'body').read_text() == '{"machine_id":8,"token":"example-machine-token"}'
+
+    def service_setup(init):
+        for name in ('log', 'config'):
+            (root / name).mkdir(exist_ok=True)
+        assignments = dict(
+            INIT=init, MEMORY=64, BUDGET=28, STAGE=stage,
+            BIN_DIR=root / 'bin', CONFIG_DIR=root / 'config', LOG_DIR=root / 'log',
+            ROTATE_CONFIG=root / 'rotate.conf', UNIT=root / 'node.service',
+            ROTATE_UNIT=root / 'rotate.service', ROTATE_TIMER=root / 'rotate.timer',
+            RC_UNIT=root / 'rc-node', RC_ROTATE=root / 'rc-rotate',
+        )
+        return '; '.join(f'{k}={shlex.quote(str(v))}' for k, v in assignments.items()) + '; '
+
+    run(service_setup('systemd') + 'mkdir() { :; }; write_services')
+    unit = (root / 'node.service').read_text()
+    assert 'MemoryHigh=40M' in unit and 'MemoryMax=48M' in unit
+    assert 'RestartSec=5' in unit and 'StartLimitBurst=3' in unit
+    assert 'credentials.env' in unit and 'example-machine-token' not in unit
+    assert 'StandardOutput=append:' in unit
+    assert (root / 'log/node.log').stat().st_mode & 0o777 == 0o600
+    rotate = (root / 'rotate.conf').read_text()
+    assert 'rotate 2' in rotate and 'size 1M' in rotate
+    run(service_setup('openrc') + 'mkdir() { :; }; write_services')
+    rc = (root / 'rc-node').read_text()
+    assert 'supervise-daemon' in rc and 'respawn_max=3' in rc
+    assert 'set -a' in rc and '/dev/null' not in rc
+    subprocess.run(SHELL + ['-n', str(root / 'rc-node')], check=True)
+    assert run(service_setup('systemd') + 'check_existing').returncode == 0
+
+    stable_systemd = 'systemctl() { case "$1" in show) echo $$;; *) return 0;; esac; }; sleep() { :; }; '
+    run(service_setup('systemd') + stable_systemd + 'start_services')
+    run(service_setup('systemd') + 'systemctl() { case "$1" in show) echo 0;; *) return 0;; esac; }; start_services', success=False)
+    mocks = root / 'mocks'
+    mocks.mkdir()
+    for name in ('rc-service', 'rc-update'):
+        mock = mocks / name
+        mock.write_text('#!/bin/sh\nexit 0\n')
+        mock.chmod(0o755)
+    mock_path = f'PATH={shlex.quote(str(mocks))}:$PATH; '
+    run(service_setup('openrc') + mock_path + 'pidof() { echo $$; }; sleep() { :; }; start_services')
+    # Two PIDs / a respawning child must not count as a stable OpenRC Node.
+    run(service_setup('openrc') + mock_path + 'pidof() { echo "1 2"; }; start_services', success=False)
+
+    # Installer lock rejects concurrent runs before OS detection or prompting.
+    lock = root / 'locked'
+    lock.mkdir()
+    p = run(f'LOCK={shlex.quote(str(lock))}; id() {{ echo 0; }}; check_existing() {{ return 1; }}; main', success=False)
+    assert '另一个安装' in p.stderr and lock.exists()
+
+    # Failed-first-install cleanup is scoped to freshly owned files.
+    preserve = root / 'unrelated'
+    preserve.write_text('keep')
+    run(service_setup('systemd') + f'LOCK={shlex.quote(str(lock))}; LOCKED=1; OWNED=1; '
+        'systemctl() { :; }; cleanup')
+    assert preserve.read_text() == 'keep'
+    assert not (root / 'config').exists() and not lock.exists()
+
+    # Real pinned xbctl + Node smoke check is optional and stays in this temp tree.
+    binaries = os.environ.get('XBOARD_TEST_BINARIES')
+    if binaries:
+        binaries = Path(binaries)
+        digests = {
+            'xbctl': '8ec7b9bbf0abb99a9c24b1b3ceef1ed5496f458e7dc22b09c33b098d5b2aad9e',
+            'xboard-node': '55bf71fa9d9f2048d3255ae7c0af929a41897ca7743f6ead34132a6ca4c79043',
+        }
+        for name, digest in digests.items():
+            assert hashlib.file_digest((binaries / name).open('rb'), 'sha256').hexdigest() == digest
+        (stage / 'config').mkdir()
+        (stage / 'bin').symlink_to(binaries, target_is_directory=True)
+        for kernel in ('singbox', 'xray'):
+            run(common + f'CONFIG_DIR={shlex.quote(str(root / "final-config"))}; KERNEL={kernel}; BUDGET=28; GOGC=50; generate_config')
+            config = (stage / 'config/config.yml').read_text()
+            assert 'gomemlimit: 28MiB' in config and 'gogc: 50' in config
+            assert 'level: warn' in config and 'level: info' not in config
+            assert 'example-machine-token' not in config and 'token_env: INSTANCE_' in config
+            assert f'type: {kernel}' in config
+            assert 'health_port: 0' in config or 'health_port:' not in config
+            env_file = stage / 'config/credentials.env'
+            assert env_file.stat().st_mode & 0o777 == 0o600
+        p = subprocess.run([str(binaries / 'xboard-node'), '-v'], capture_output=True, text=True, check=True)
+        assert 'v1.13' in p.stdout
+        # Real Node talks to a local HTTPS mock panel. No real account or server.
+        cert = root / 'cert.pem'
+        key = root / 'key.pem'
+        subprocess.run(['openssl', 'req', '-x509', '-newkey', 'rsa:2048', '-nodes',
+                        '-keyout', str(key), '-out', str(cert), '-days', '1',
+                        '-subj', '/CN=localhost', '-addext', 'subjectAltName=DNS:localhost'],
+                       check=True, capture_output=True)
+        with socket.socket() as s:
+            s.bind(('127.0.0.1', 0))
+            node_port = s.getsockname()[1]
+        requests = []
+
+        class Panel(BaseHTTPRequestHandler):
+            def log_message(self, *args):
+                pass
+
+            def reply(self, data):
+                body = json.dumps(data).encode()
+                self.send_response(200)
+                self.send_header('Content-Type', 'application/json')
+                self.send_header('Content-Length', str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def do_POST(self):
+                body = json.loads(self.rfile.read(int(self.headers['Content-Length'])))
+                assert body['machine_id'] == 8 and body['token'] == 'example-machine-token'
+                requests.append(self.path)
+                if self.path.endswith('/machine/nodes'):
+                    self.reply({'nodes': [{'id': 1, 'type': 'vless', 'name': 'example'}],
+                                'base_config': {'push_interval': 60, 'pull_interval': 60}})
+                elif self.path.endswith('/handshake'):
+                    self.reply({'websocket': {'enabled': False}})
+                else:
+                    self.reply({})
+
+            def do_GET(self):
+                requests.append(self.path.split('?')[0])
+                if self.path.split('?')[0].endswith('/config'):
+                    self.reply({'protocol': 'vless', 'listen_ip': '127.0.0.1',
+                                'server_port': node_port, 'network': 'tcp', 'tls': 0,
+                                # Upstream blocks private destinations by default;
+                                # only this isolated echo target is allowed in the mock.
+                                'custom_route_rules': [{
+                                    'name': 'local-test-only',
+                                    'match': {'ip_cidrs': ['127.0.0.1/32'],
+                                              'ports': [str(echo.server_address[1])]},
+                                    'action': {'type': 'direct'}}],
+                                'base_config': {'push_interval': 60, 'pull_interval': 60}})
+                else:
+                    self.reply({'users': [{'id': 1, 'uuid': '00000000-0000-4000-8000-000000000001',
+                                           'speed_limit': 0, 'device_limit': 0}]})
+
+        server = ThreadingHTTPServer(('127.0.0.1', 0), Panel)
+        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        ctx.load_cert_chain(cert, key)
+        server.socket = ctx.wrap_socket(server.socket, server_side=True)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        class Echo(socketserver.BaseRequestHandler):
+            def handle(self):
+                self.request.sendall(self.request.recv(128))
+
+        echo = socketserver.ThreadingTCPServer(('127.0.0.1', 0), Echo)
+        threading.Thread(target=echo.serve_forever, daemon=True).start()
+        try:
+            for kernel in ('singbox', 'xray'):
+                run(f'STAGE={shlex.quote(str(stage))}; CONFIG_DIR={shlex.quote(str(root / "final-config"))}; '
+                    f'PANEL=https://localhost:{server.server_port}; TOKEN=example-machine-token; MACHINE_ID=8; '
+                    f'KERNEL={kernel}; BUDGET=28; GOGC=50; generate_config')
+                env_key, value = env_file.read_text().strip().split('=', 1)
+                env = dict(os.environ, SSL_CERT_FILE=str(cert))
+                env[env_key] = value.strip("'")
+                with (root / 'runtime.log').open('w') as log:
+                    process = subprocess.Popen([str(binaries / 'xboard-node'), '-c', str(stage / 'config/config.yml')],
+                                               env=env, stdout=log, stderr=log)
+                    try:
+                        deadline = time.monotonic() + 10
+                        while True:
+                            assert process.poll() is None, (root / 'runtime.log').read_text()
+                            try:
+                                with socket.create_connection(('127.0.0.1', node_port), timeout=0.2):
+                                    break
+                            except OSError:
+                                assert time.monotonic() < deadline, (root / 'runtime.log').read_text()
+                                time.sleep(0.1)
+                        assert '/api/v2/server/machine/nodes' in requests
+                        assert '/api/v2/server/config' in requests and '/api/v2/server/user' in requests
+                        # VLESS TCP request to an isolated loopback echo target.
+                        with socket.create_connection(('127.0.0.1', node_port), timeout=3) as client:
+                            message = b'installer-check'
+                            header = (b'\x00' + uuid.UUID('00000000-0000-4000-8000-000000000001').bytes +
+                                      b'\x00\x01' + echo.server_address[1].to_bytes(2, 'big') +
+                                      b'\x01' + socket.inet_aton('127.0.0.1'))
+                            client.sendall(header + message)
+                            stream = client.makefile('rb')
+                            try:
+                                assert stream.read(2) == b'\x00\x00'
+                                assert stream.read(len(message)) == message
+                            except (OSError, AssertionError) as error:
+                                raise AssertionError((kernel, (root / 'runtime.log').read_text())) from error
+                    finally:
+                        process.terminate()
+                        try:
+                            process.wait(timeout=10)
+                        except subprocess.TimeoutExpired:
+                            process.kill()
+                            process.wait(timeout=5)
+                requests.clear()
+        finally:
+            server.shutdown()
+            server.server_close()
+            echo.shutdown()
+            echo.server_close()
+        print('PASS: verified official binaries; both kernels authenticated to local HTTPS panel and relayed VLESS TCP')
+
+print('PASS: command import, injection rejection, cgroup limits, private auth, service generation, lock and first-install cleanup')
