@@ -21,24 +21,32 @@
 
 ## 安装
 
-以 root 在服务器终端运行（需要已有 `curl`）：
+以 root 在服务器终端运行（需要已有 `curl`）。先完整下载，下载成功才执行；临时脚本退出后自动删除：
+
+```sh
+(
+  installer=$(mktemp) || exit 1
+  trap 'rm -f "$installer"' EXIT
+  curl -fL --retry 2 --connect-timeout 15 --max-time 120 \
+    https://raw.githubusercontent.com/longfeng258-tech/xboard-node-onekey/main/install.sh -o "$installer" &&
+    sh "$installer"
+)
+```
+
+普通 sudo 用户将最后一行改为 `sudo sh "$installer"`。原管道入口仍兼容：
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/longfeng258-tech/xboard-node-onekey/main/install.sh | sh
 ```
 
-普通 sudo 用户：
+POSIX sh 的管道返回最后一个命令的状态：下载失败且没有内容时，`curl | sh` 可能仍返回 0。因此优先使用上面的下载后执行方式。
+
+Alpine 没有 curl 时，先以 root 运行 `apk add --no-cache curl ca-certificates`。Alpine 上的 Node 服务由本脚本通过 OpenRC 配置，不需要安装 `sudo`、Bash 或 systemd；后台命令中的 `sudo bash` 仅用于导入参数，不会被执行。也可以先下载并阅读脚本，再执行：
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/longfeng258-tech/xboard-node-onekey/main/install.sh | sudo sh
-```
-
-Alpine 没有 curl 时，先以 root 运行 `apk add --no-cache curl ca-certificates`。Alpine 上的 Node 服务由本脚本通过 OpenRC 配置，不需要安装 `sudo`、Bash 或 systemd；后台命令中的 `sudo bash` 仅用于导入参数，不会被执行。建议先下载并阅读脚本，再执行：
-
-```sh
-curl -fsSL https://raw.githubusercontent.com/longfeng258-tech/xboard-node-onekey/main/install.sh -o install.sh
-less install.sh
-sh install.sh
+curl -fsSL https://raw.githubusercontent.com/longfeng258-tech/xboard-node-onekey/main/install.sh -o install.sh &&
+  less install.sh &&
+  sh install.sh
 ```
 
 上面的下载后执行方式适用于 root；普通 sudo 用户将最后一行改为 `sudo sh install.sh`。
@@ -47,12 +55,14 @@ sh install.sh
 
 1. 检测已有安装、系统、服务管理器、架构、有效内存和磁盘。
 2. 提示粘贴后台完整安装命令；输入隐藏，**不会执行所粘贴的命令**。格式有误可重新粘贴，最多三次。
-3. 选择 sing-box / Xray。
-4. 选择推荐 Go 内存预算，或输入自己的 MiB 数值。
+3. 选择 sing-box / Xray，输错时在本步骤重试，回车使用推荐值。
+4. 选择推荐 Go 内存预算，或输入自己的 MiB 数值；无效数值可重输，回车可返回推荐预算，不需要再次粘贴接入命令。
 5. 安装缺少的工具，检查面板机器鉴权和 Alpine cron，下载并校验官方程序，生成配置。
 6. 启动服务并设置开机启动；分别报告进程状态和面板节点分配情况。
 
 每个阶段都有 `==>` 进度提示。看到“面板机器鉴权通过”时仍会继续安装，只有最后出现“安装完成”才代表首装成功；节点数为 0 也可以完成首装。
+
+官方二进制下载使用 curl 自带进度条、有限重试和超时；连续 60 秒平均传输速度低于 1 字节/秒时中止该次传输，再按 curl 的临时错误规则重试。仍校验固定 SHA256，不用第三方下载代理或自制下载器。
 
 后台命令必须包含完整的 `--machine-id` 数值。接受的格式示例仅用于说明，示例不是可用凭据：
 
@@ -85,7 +95,7 @@ curl -fsSL https://raw.githubusercontent.com/cedar2025/xboard-node/dev/install.s
 
 Alpine 会检查 `crond` 的 OpenRC 服务是否存在，缺少时安装 `busybox-openrc`，并在下载 Node 之前确认 cron 可以启动。某些精简镜像删除了已安装包中的 `hostname` 服务，导致 `syslog` 和 `crond` 无法启动：只有确认该文件缺失且已安装的 `openrc` 包清单包含它时，脚本才执行一次 `apk fix --no-cache openrc` 恢复包文件，再检查服务。采用包管理器的配置保护规则保留现有配置，不启用升级或覆盖配置选项。未恢复或其他依赖失败时停止，不绕过服务依赖。
 
-本次诊断日志位于 `/var/log/xboard-node-install.随机后缀`，权限 600。依赖安装和服务管理器的输出写入该文件，失败时显示路径和退出阶段；普通意外退出也会报告错误。失败清理 Node 文件前会保留最多 64KiB 的 Node 日志到诊断文件，成功后删除临时诊断文件。它可能包含私有信息，分享前必须脱敏；排查结束后可手动删除对应文件。无法创建诊断文件时会明确报错，强制 `kill -9`、断电或终端不显示输出仍无法保证反馈。
+本次诊断日志位于 `/var/log/xboard-node-install.随机后缀`，权限 600。依赖安装、摘要校验、二进制启动检查、官方配置生成错误和服务管理器的输出写入该文件，失败时显示路径和退出阶段；普通意外退出也会报告错误。失败清理 Node 文件前会保留最多 64KiB 的 Node 日志到诊断文件，成功后删除临时诊断文件。它可能包含私有信息，分享前必须脱敏；排查结束后可手动删除对应文件。无法创建诊断文件时会明确报错，强制 `kill -9`、断电或终端不显示输出仍无法保证反馈。
 
 ## 内存和日志
 
@@ -132,7 +142,7 @@ rc-service crond status
 
 ## 开发和贡献
 
-参见 [CONTRIBUTING.md](CONTRIBUTING.md) 和 [SECURITY.md](SECURITY.md)。Linux 离线验证（需要 Python 3、jq、logrotate、ShellCheck）：
+参见 [CONTRIBUTING.md](CONTRIBUTING.md)、[SECURITY.md](SECURITY.md) 和 [成熟安装器源码对照](docs/installer-research.md)。Linux 离线验证（需要 Python 3、jq、logrotate、ShellCheck）：
 
 ```sh
 shellcheck -S warning install.sh

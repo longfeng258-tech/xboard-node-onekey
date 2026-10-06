@@ -2,6 +2,8 @@
 
 欢迎提交 Issue 或 Pull Request。范围是 Debian / Ubuntu / Alpine 上的 Xboard-Node **首装**，优先复用官方程序和系统工具，保持 POSIX sh 兼容。
 
+实现前先检查仓库已有能力、官方实现和成熟同类项目；优先调用现有 CLI、系统工具或包管理器。借鉴方案时说明源码出处、适配边界及许可证，确认现有能力不满足后才添加最小实现。参见 [安装器源码对照](docs/installer-research.md)。
+
 提交前说明问题、实际行为和验证方法，运行 README 中的离线检查。涉及发行版、架构或服务管理器的变化，说明在什么环境验证过；未经验证的环境不得写成已支持。
 
 不要提交真实面板地址、服务器地址、机器 Token、SSH 密钥、原始配置或日志。例子使用 `panel.example.com` 和 `example-machine-token`，敏感日志先脱敏。安全问题请按 SECURITY.md 处理。
