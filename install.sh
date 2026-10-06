@@ -213,21 +213,35 @@ read_private_command() {
 }
 
 choose_options() {
-    printf '内核：1) sing-box（默认推荐）  2) Xray [1]: ' >&3
-    IFS= read -r answer <&3 || die '输入中断。'
-    case "$answer" in ''|1) KERNEL=singbox ;; 2) KERNEL=xray ;; *) die '请输入 1 或 2。' ;; esac
+    while :; do
+        printf '内核：1) sing-box（默认推荐）  2) Xray [1]: ' >&3
+        IFS= read -r answer <&3 || die '输入中断。'
+        case "$answer" in ''|1) KERNEL=singbox; break ;; 2) KERNEL=xray; break ;; esac
+        say '请输入 1 或 2；直接回车使用推荐值。' >&3
+    done
     BUDGET=$(recommended_budget "$MEMORY")
     say "推荐 Go 软内存预算：${BUDGET}MiB；它不等于服务器内存或进程 RSS。" >&3
-    printf '内存优化：1) 推荐  2) 自定义预算（MiB） [1]: ' >&3
-    IFS= read -r answer <&3 || die '输入中断。'
-    case "$answer" in
-        ''|1) ;;
-        2) printf '输入 Go 预算整数（MiB）：' >&3
-           IFS= read -r BUDGET <&3 || die '输入中断。' ;;
-        *) die '请输入 1 或 2。' ;;
-    esac
-    case "$BUDGET" in ''|*[!0-9]*) die '内存预算必须是整数。' ;; esac
-    [ "${#BUDGET}" -le 8 ] && [ "$BUDGET" -ge 16 ] && [ "$BUDGET" -le "$((MEMORY - 32))" ] || die '预算必须至少 16MiB，并保留至少 32MiB 给 Go 以外的占用和系统。'
+    while :; do
+        printf '内存优化：1) 推荐  2) 自定义预算（MiB） [1]: ' >&3
+        IFS= read -r answer <&3 || die '输入中断。'
+        case "$answer" in ''|1|2) break ;; esac
+        say '请输入 1 或 2；直接回车使用推荐值。' >&3
+    done
+    if [ "$answer" = 2 ]; then
+        while :; do
+            printf '输入 Go 预算整数（MiB），直接回车使用推荐值：' >&3
+            IFS= read -r answer <&3 || die '输入中断。'
+            [ -n "$answer" ] || break
+            case "$answer" in
+                *[!0-9]*) say '内存预算必须是整数，请重新输入。' >&3; continue ;;
+            esac
+            if [ "${#answer}" -le 8 ] && [ "$answer" -ge 16 ] && [ "$answer" -le "$((MEMORY - 32))" ]; then
+                BUDGET=$answer
+                break
+            fi
+            say "预算范围为 16–$((MEMORY - 32))MiB，请重新输入或回车使用推荐值。" >&3
+        done
+    fi
     BUDGET=$(awk -v m="$BUDGET" 'BEGIN {printf "%d", m}')
     GOGC=100
     [ "$MEMORY" -gt 256 ] || GOGC=50
@@ -336,14 +350,15 @@ download_binaries() {
     mkdir "$STAGE/bin" "$STAGE/config"
     for name in xboard-node xbctl; do
         say "下载官方 $VERSION / $ARCH / $name……"
-        curl -q --fail --silent --show-error --location --proto '=https' --proto-redir '=https' \
-            --connect-timeout 15 --max-time 900 --retry 2 --max-filesize 80000000 \
+        curl -q --fail --progress-bar --show-error --location --proto '=https' --proto-redir '=https' \
+            --connect-timeout 15 --max-time 900 --speed-time 60 --speed-limit 1 \
+            --retry 2 --retry-max-time 900 --max-filesize 80000000 \
             --output "$STAGE/bin/$name" "$RELEASE/$VERSION/$name-linux-$ARCH" || die '官方二进制下载失败。'
     done
     printf '%s  %s\n%s  %s\n' "$node_sha" "$STAGE/bin/xboard-node" "$ctl_sha" "$STAGE/bin/xbctl" |
-        sha256sum -c - >/dev/null 2>&1 || die 'SHA256 校验失败，停止安装。'
+        sha256sum -c - >>"${DIAG_LOG:-/dev/null}" 2>&1 || die 'SHA256 校验失败，停止安装。'
     chmod 755 "$STAGE/bin/xboard-node" "$STAGE/bin/xbctl"
-    GOMEMLIMIT="${BUDGET}MiB" GOGC="$GOGC" "$STAGE/bin/xboard-node" -v >/dev/null 2>&1 || die '二进制无法在当前系统运行。'
+    GOMEMLIMIT="${BUDGET}MiB" GOGC="$GOGC" "$STAGE/bin/xboard-node" -v >>"${DIAG_LOG:-/dev/null}" 2>&1 || die '二进制无法在当前系统运行。'
 }
 
 generate_config() {
@@ -352,7 +367,7 @@ generate_config() {
         --mode machine --panel-url "$PANEL" --machine-id "$MACHINE_ID" \
         --kernel "$KERNEL" --gomemlimit "${BUDGET}MiB" --gogc "$GOGC" \
         --health-port 0 --install-root "$CONFIG_DIR" --output "$STAGE/config/config.yml" \
-        >"$STAGE/config-meta" 2>/dev/null || die '官方配置生成失败。'
+        >"$STAGE/config-meta" 2>>"${DIAG_LOG:-/dev/null}" || die '官方配置生成失败。'
     env_key=$(sed -n 's/^ENV_KEY=//p' "$STAGE/config-meta")
     case "$env_key" in INSTANCE_*_MACHINE_TOKEN) ;; *) die '凭据字段生成失败。' ;; esac
     case "$env_key" in *[!A-Z0-9_]*) die '凭据字段无效。' ;; esac

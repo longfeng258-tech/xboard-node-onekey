@@ -81,17 +81,20 @@ for attack in [
     assert not p.stdout, 'rejected command must not emit private fields'
 
 # Paste immediately after the prompt, including queued retries, to catch leaks.
-for pasted_command, valid in [
-    (COMMAND, True),
+for pasted_command, valid, options, kernel in [
+    (COMMAND, True, '1\n2\n00000028\n', 'singbox'),
     ('invalid example-machine-token\n' + COMMAND.replace(
-        installer_url, f'[{installer_url}]({installer_url})'), True),
-    ('invalid example-machine-token\n' * 2 + 'invalid example-machine-token', False),
+        installer_url, f'[{installer_url}]({installer_url})'), True, '\n\n', 'singbox'),
+    ('invalid example-machine-token\n' * 2 + 'invalid example-machine-token', False, '', ''),
+    # Mistyped menu choices and budgets must retry without reimporting credentials.
+    (COMMAND, True, '9\n2\nbad\n2\nnope\n15\n33\n999999999\n28\n', 'xray'),
+    (COMMAND, True, '\n2\n\n', 'singbox'),
 ]:
     pid, terminal = pty.fork()
     if pid == 0:
         os.execvp(SHELL[0], SHELL + ['-c', BASE +
                   'trap cleanup EXIT; MEMORY=64; read_private_command </dev/null; choose_options </dev/null; '
-                  'printf "PRIVATE_OK:%s:%s\\n" "$MACHINE_ID" "$BUDGET"'])
+                  'printf "PRIVATE_OK:%s:%s:%s\\n" "$MACHINE_ID" "$BUDGET" "$KERNEL"'])
     output = b''
     sent = False
     deadline = time.monotonic() + 10
@@ -109,20 +112,39 @@ for pasted_command, valid in [
                 break
             output += chunk
             if not sent and '输入隐藏'.encode() in output:
-                suffix = '\n1\n2\n00000028\n' if valid else '\n'
-                os.write(terminal, (pasted_command + suffix).encode())
+                os.write(terminal, (pasted_command + '\n' + options).encode())
                 sent = True
         _, status = os.waitpid(pid, 0)
         if valid:
-            assert status == 0 and b'PRIVATE_OK:8:28' in output, output
+            assert status == 0 and f'PRIVATE_OK:8:28:{kernel}'.encode() in output, output
         else:
             assert status != 0 and '连续三次输入无效'.encode() in output, output
         assert b'example-machine-token' not in output, 'terminal echoed private command'
     finally:
         os.close(terminal)
 
+# EOF still exits: input retry must not spin forever after a disconnected terminal.
+p = run('MEMORY=64; exec 3>&1; read() { return 1; }; choose_options', success=False)
+assert '输入中断' in p.stderr
+
 with tempfile.TemporaryDirectory(prefix='xboard-check-') as temp:
     root = Path(temp)
+    # Run the documented entry: neither empty nor partial failed downloads execute.
+    entry = (SCRIPT.parent / 'README.md').read_text().split('```sh\n', 1)[1].split('```', 1)[0]
+    for curl_exit in (0, 22, 28):
+        entry_dir = root / f'entry-{curl_exit}'
+        entry_dir.mkdir()
+        marker = entry_dir / 'executed'
+        setup = (f'TMPDIR={shlex.quote(str(entry_dir))}; export TMPDIR; '
+                 'curl() { while [ "$1" != -o ]; do shift; done; shift; '
+                 f'if [ {curl_exit} != 22 ]; then '
+                 f'printf \'touch "%s"\\n\' {shlex.quote(str(marker))} >"$1"; '
+                 'else : >"$1"; fi; '
+                 f'return {curl_exit}; }}; ')
+        run(setup + entry, success=curl_exit == 0)
+        assert marker.exists() == (curl_exit == 0)
+        assert set(entry_dir.iterdir()) == ({marker} if curl_exit == 0 else set())
+
     proc = root / 'proc'
     (proc / 'self').mkdir(parents=True)
     cg = root / 'cg'
@@ -292,6 +314,32 @@ esac
         assert expected in p.stdout, p.stdout
         assert 'example-machine-token' not in p.stdout + p.stderr
         assert 'https://panel.example.com' not in p.stdout + p.stderr
+
+    # Config generation errors belong in the private diagnostic, not the terminal.
+    config_stage = root / 'config-failure'
+    (config_stage / 'bin').mkdir(parents=True)
+    (config_stage / 'config').mkdir()
+    ctl = config_stage / 'bin/xbctl'
+    ctl.write_text('#!/bin/sh\necho "example-machine-token private config error" >&2\nexit 1\n')
+    ctl.chmod(0o755)
+    diagnostic = root / 'config-diagnostic'
+    p = run(common + f'STAGE={shlex.quote(str(config_stage))}; '
+            f'DIAG_LOG={shlex.quote(str(diagnostic))}; '
+            'KERNEL=singbox; BUDGET=28; GOGC=50; generate_config', success=False)
+    assert '官方配置生成失败' in p.stderr
+    assert 'example-machine-token' not in p.stdout + p.stderr
+    assert diagnostic.read_text() == 'example-machine-token private config error\n'
+    assert diagnostic.stat().st_mode & 0o777 == 0o600
+
+    # A stalled/failed download must stop before checking or running the binary.
+    download_stage = root / 'download-failure'
+    download_stage.mkdir()
+    p = run(f'STAGE={shlex.quote(str(download_stage))}; ARCH=amd64; '
+            'curl() { return 28; }; '
+            'sha256sum() { echo must-not-reach-check; return 0; }; '
+            'download_binaries', success=False)
+    assert '官方二进制下载失败' in p.stderr
+    assert 'must-not-reach-check' not in p.stdout + p.stderr
 
     def service_setup(init):
         for name in ('log', 'config'):
