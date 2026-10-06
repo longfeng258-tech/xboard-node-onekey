@@ -155,6 +155,35 @@ with tempfile.TemporaryDirectory(prefix='xboard-check-') as temp:
     # Private JSON auth is stdin; curl argv never receives the token or redirects.
     stage = root / 'stage'
     stage.mkdir()
+    # Minimal Alpine images can have crond but no OpenRC service for it.
+    mockbin = root / 'mockbin'
+    mockbin.mkdir()
+    (mockbin / 'rc-service').write_text('#!/bin/sh\ntest -e "$STAGE/cron-ready"\n')
+    (mockbin / 'apk').write_text(
+        '#!/bin/sh\nprintf "%s\\n" "$@" >"$STAGE/apk-argv"\n: >"$STAGE/cron-ready"\n')
+    for path in mockbin.iterdir():
+        path.chmod(0o755)
+    dependency_probe = (f'STAGE={shlex.quote(str(stage))}; export STAGE; INIT=openrc; '
+                        f'PATH={shlex.quote(str(mockbin))}:$PATH; '
+                        'command() { return 0; }; install_dependencies')
+    run(dependency_probe)
+    assert 'busybox-openrc' in (stage / 'apk-argv').read_text().splitlines()
+    (mockbin / 'rc-update').write_text('#!/bin/sh\nexit 0\n')
+    (mockbin / 'rc-update').chmod(0o755)
+    (mockbin / 'rc-service').write_text('#!/bin/sh\nexit 1\n')
+    p = run(f'PATH={shlex.quote(str(mockbin))}:$PATH; '
+            f'LOCK={shlex.quote(str(root / "cron-lock"))}; '
+            f'mktemp() {{ printf "%s\\n" {shlex.quote(str(stage))}; }}; '
+            'id() { echo 0; }; check_existing() { return 1; }; '
+            'detect_platform() { INIT=openrc; }; read_private_command() { :; }; '
+            'choose_options() { :; }; install_dependencies() { :; }; '
+            'check_panel() { NODE_COUNT=0; }; '
+            f'download_binaries() {{ touch {shlex.quote(str(root / "download-called"))}; }}; main',
+            success=False)
+    assert 'OpenRC crond 服务无法启动' in p.stderr
+    assert not (root / 'download-called').exists()
+    assert not (root / 'cron-lock').exists()
+
     common = f'STAGE={shlex.quote(str(stage))}; PANEL=https://panel.example.com; TOKEN=example-machine-token; MACHINE_ID=8; '
     fake_curl = '''curl() {
         printf '%s\\n' "$@" >"$STAGE/argv";

@@ -231,10 +231,15 @@ install_dependencies() {
         command -v "$cmd" >/dev/null 2>&1 || missing=1
     done
     [ -s /etc/ssl/certs/ca-certificates.crt ] || missing=1
+    if [ "$INIT" = openrc ]; then
+        rc-service --exists crond >/dev/null 2>&1 || missing=1
+    fi
     [ -n "$missing" ] || return 0
     say '安装缺少的下载、JSON 校验、证书和日志轮转工具……'
     if [ "$INIT" = openrc ]; then
-        apk add --no-cache curl ca-certificates jq logrotate >/dev/null 2>&1 || die '依赖安装失败，请检查 apk 软件源和可用资源。'
+        set -- curl ca-certificates jq logrotate
+        if ! rc-service --exists crond >/dev/null 2>&1; then set -- "$@" busybox-openrc; fi
+        apk add --no-cache "$@" >/dev/null 2>&1 || die '依赖安装失败，请检查 apk 软件源和可用资源。'
     else
         apt-get -o Acquire::Languages=none update -qq >/dev/null 2>&1 || die 'apt 软件源更新失败。'
         DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends curl ca-certificates jq logrotate >/dev/null 2>&1 || die '依赖安装失败，请检查 apt 软件源和可用资源。'
@@ -242,6 +247,9 @@ install_dependencies() {
     for cmd in curl jq sha256sum logrotate; do
         command -v "$cmd" >/dev/null 2>&1 || die '安装后仍缺少必要工具。'
     done
+    if [ "$INIT" = openrc ]; then
+        rc-service --exists crond >/dev/null 2>&1 || die '缺少 crond 的 OpenRC 服务；请检查 busybox-openrc 软件包。'
+    fi
 }
 
 check_panel() {
@@ -432,8 +440,6 @@ start_services() {
         systemctl daemon-reload >/dev/null 2>&1 &&
         systemctl enable --now xboard-node-logrotate.timer xboard-node.service >/dev/null 2>&1 || return 1
     else
-        rc-update add crond default >/dev/null 2>&1 &&
-        rc-service crond start >/dev/null 2>&1 &&
         rc-update add xboard-node default >/dev/null 2>&1 &&
         rc-service xboard-node start >/dev/null 2>&1 || return 1
     fi
@@ -495,6 +501,11 @@ main() {
     STAGE=$(mktemp -d /usr/local/lib/.xboard-node.XXXXXX) || die '无法创建磁盘暂存目录。'
     check_panel || die "$PANEL_ERROR"
     say "面板机器鉴权通过；已分配节点数：$NODE_COUNT（不显示接入地址或凭据）。"
+    if [ "$INIT" = openrc ]; then
+        rc-update add crond default >/dev/null 2>&1 &&
+        rc-service crond start >/dev/null 2>&1 ||
+            die 'OpenRC crond 服务无法启动；请检查 hostname、logger 等基础服务及系统日志。精简镜像缺失包文件时可用 apk fix openrc 修复，脚本不会自动修复系统服务。'
+    fi
     download_binaries
     generate_config
     if check_existing; then die '安装期间出现已有安装，停止写入。'; fi

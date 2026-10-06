@@ -76,8 +76,11 @@ curl -fsSL https://raw.githubusercontent.com/cedar2025/xboard-node/dev/install.s
 | HTTP 3xx 重定向 | 使用最终 HTTPS 面板地址，检查域名及登录跳转；安装器不会自动跟随鉴权重定向 |
 | DNS / 连接 / 超时 / TLS 错误 | 检查服务器出站网络、域名、证书、系统时间和 CA 包 |
 | HTTP 429 / 5xx | 检查面板或代理运行状态，稍后重试 |
+| OpenRC crond 无法启动 | 检查基础服务及系统日志；某些精简镜像缺失 OpenRC 包文件，可用 `apk fix openrc` 修复 |
 
 更换安装器不会修复后台停用或不存在的机器。鉴权失败发生在下载 Node 和写入服务之前；修正后台配置后重新运行即可。安装后复查失败会显示具体分类并保留已启动服务。
+
+Alpine 会检查 `crond` 的 OpenRC 服务是否存在，缺少时安装 `busybox-openrc`，并在下载 Node 之前确认 cron 可以启动。若镜像删除了 `hostname` 等基础服务文件，安装器给出明确提示，不自动修复 OpenRC 包或更改系统服务依赖。
 
 ## 内存和日志
 
