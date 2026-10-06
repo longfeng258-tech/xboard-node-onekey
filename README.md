@@ -33,7 +33,7 @@ curl -fsSL https://raw.githubusercontent.com/longfeng258-tech/xboard-node-onekey
 curl -fsSL https://raw.githubusercontent.com/longfeng258-tech/xboard-node-onekey/main/install.sh | sudo sh
 ```
 
-Alpine 没有 curl 时，先以 root 运行 `apk add --no-cache curl ca-certificates`。Alpine 的 OpenRC 安装由本脚本处理，不需要安装 `sudo`、Bash 或 systemd；后台命令中的 `sudo bash` 仅用于导入参数，不会被执行。建议先下载并阅读脚本，再执行：
+Alpine 没有 curl 时，先以 root 运行 `apk add --no-cache curl ca-certificates`。Alpine 上的 Node 服务由本脚本通过 OpenRC 配置，不需要安装 `sudo`、Bash 或 systemd；后台命令中的 `sudo bash` 仅用于导入参数，不会被执行。建议先下载并阅读脚本，再执行：
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/longfeng258-tech/xboard-node-onekey/main/install.sh -o install.sh
@@ -49,8 +49,10 @@ sh install.sh
 2. 提示粘贴后台完整安装命令；输入隐藏，**不会执行所粘贴的命令**。格式有误可重新粘贴，最多三次。
 3. 选择 sing-box / Xray。
 4. 选择推荐 Go 内存预算，或输入自己的 MiB 数值。
-5. 安装缺少的工具，检查面板机器鉴权，下载并校验官方程序，生成配置。
+5. 安装缺少的工具，检查面板机器鉴权和 Alpine cron，下载并校验官方程序，生成配置。
 6. 启动服务并设置开机启动；分别报告进程状态和面板节点分配情况。
+
+每个阶段都有 `==>` 进度提示。看到“面板机器鉴权通过”时仍会继续安装，只有最后出现“安装完成”才代表首装成功；节点数为 0 也可以完成首装。
 
 后台命令必须包含完整的 `--machine-id` 数值。接受的格式示例仅用于说明，示例不是可用凭据：
 
@@ -76,11 +78,14 @@ curl -fsSL https://raw.githubusercontent.com/cedar2025/xboard-node/dev/install.s
 | HTTP 3xx 重定向 | 使用最终 HTTPS 面板地址，检查域名及登录跳转；安装器不会自动跟随鉴权重定向 |
 | DNS / 连接 / 超时 / TLS 错误 | 检查服务器出站网络、域名、证书、系统时间和 CA 包 |
 | HTTP 429 / 5xx | 检查面板或代理运行状态，稍后重试 |
-| OpenRC crond 无法启动 | 检查基础服务及系统日志；某些精简镜像缺失 OpenRC 包文件，可用 `apk fix openrc` 修复 |
+| OpenRC crond 无法启动 | 查看本次私有诊断日志中的服务依赖错误，检查镜像基础服务 |
+| 安装意外停止 | 提示会给出失败阶段、退出码及本次私有诊断日志路径 |
 
 更换安装器不会修复后台停用或不存在的机器。鉴权失败发生在下载 Node 和写入服务之前；修正后台配置后重新运行即可。安装后复查失败会显示具体分类并保留已启动服务。
 
-Alpine 会检查 `crond` 的 OpenRC 服务是否存在，缺少时安装 `busybox-openrc`，并在下载 Node 之前确认 cron 可以启动。若镜像删除了 `hostname` 等基础服务文件，安装器给出明确提示，不自动修复 OpenRC 包或更改系统服务依赖。
+Alpine 会检查 `crond` 的 OpenRC 服务是否存在，缺少时安装 `busybox-openrc`，并在下载 Node 之前确认 cron 可以启动。某些精简镜像删除了已安装包中的 `hostname` 服务，导致 `syslog` 和 `crond` 无法启动：只有确认该文件缺失且已安装的 `openrc` 包清单包含它时，脚本才执行一次 `apk fix --no-cache openrc` 恢复包文件，再检查服务。采用包管理器的配置保护规则保留现有配置，不启用升级或覆盖配置选项。未恢复或其他依赖失败时停止，不绕过服务依赖。
+
+本次诊断日志位于 `/var/log/xboard-node-install.随机后缀`，权限 600。依赖安装和服务管理器的输出写入该文件，失败时显示路径和退出阶段；普通意外退出也会报告错误。失败清理 Node 文件前会保留最多 64KiB 的 Node 日志到诊断文件，成功后删除临时诊断文件。它可能包含私有信息，分享前必须脱敏；排查结束后可手动删除对应文件。无法创建诊断文件时会明确报错，强制 `kill -9`、断电或终端不显示输出仍无法保证反馈。
 
 ## 内存和日志
 
