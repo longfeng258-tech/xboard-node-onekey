@@ -33,18 +33,20 @@ curl -fsSL https://raw.githubusercontent.com/longfeng258-tech/xboard-node-onekey
 curl -fsSL https://raw.githubusercontent.com/longfeng258-tech/xboard-node-onekey/main/install.sh | sudo sh
 ```
 
-Alpine 没有 curl 时，先运行 `apk add --no-cache curl ca-certificates`。建议先下载并阅读脚本，再执行：
+Alpine 没有 curl 时，先以 root 运行 `apk add --no-cache curl ca-certificates`。Alpine 的 OpenRC 安装由本脚本处理，不需要安装 `sudo`、Bash 或 systemd；后台命令中的 `sudo bash` 仅用于导入参数，不会被执行。建议先下载并阅读脚本，再执行：
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/longfeng258-tech/xboard-node-onekey/main/install.sh -o install.sh
 less install.sh
-sudo sh install.sh
+sh install.sh
 ```
+
+上面的下载后执行方式适用于 root；普通 sudo 用户将最后一行改为 `sudo sh install.sh`。
 
 交互流程：
 
 1. 检测已有安装、系统、服务管理器、架构、有效内存和磁盘。
-2. 提示粘贴后台完整安装命令；输入隐藏，**不会执行所粘贴的命令**。
+2. 提示粘贴后台完整安装命令；输入隐藏，**不会执行所粘贴的命令**。格式有误可重新粘贴，最多三次。
 3. 选择 sing-box / Xray。
 4. 选择推荐 Go 内存预算，或输入自己的 MiB 数值。
 5. 安装缺少的工具，检查面板机器鉴权，下载并校验官方程序，生成配置。
@@ -58,7 +60,27 @@ curl -fsSL https://raw.githubusercontent.com/cedar2025/xboard-node/dev/install.s
 
 接受单引号、双引号、空白和可选 `sudo`；四个参数顺序可变。只接受上述官方来源和四个参数，不接受额外 shell 命令、重定向、反斜线、变量展开、换行、额外参数或省略 ID。Token 字符集限英文字母、数字、`.`、`_`、`~`、`-`，最多 512 字符。面板 URL 支持 HTTPS 域名或 IPv4、端口和基本路径；暂不支持 IPv6 字面量、URL 用户名密码、查询或片段。
 
+兼容复制时带入的不换行空格，以及安装脚本或面板网址的 `[https://网址](https://网址)` Markdown 格式；链接显示的网址必须与目标完全一致，仍校验官方脚本来源和 HTTPS 面板地址。不接受仅写链接标题或显示网址与目标不一致的链接。首次启动本脚本的 `curl` 命令仍应使用上方代码块中的纯网址。
+
 **不要把自己的后台命令提交到 Issue、README、终端截图或公开聊天里。**
+
+## 接入失败时
+
+安装器区分网络、HTTPS、HTTP 状态和 JSON 格式错误，并给出对应排查建议；不会直接显示面板返回的原始内容、地址或 Token。
+
+| 提示 | 下一步 |
+| --- | --- |
+| HTTP 403：机器不存在或已停用 | 在后台确认命令中的机器 ID 对应机器存在且已启用，再重新复制该机器的安装命令 |
+| HTTP 401 / 其他 HTTP 403 | 核对当前机器 Token、启用状态及面板访问限制 |
+| HTTP 404 / 返回格式不符 | 核对面板地址、machine API 支持及登录跳转 |
+| HTTP 3xx 重定向 | 使用最终 HTTPS 面板地址，检查域名及登录跳转；安装器不会自动跟随鉴权重定向 |
+| DNS / 连接 / 超时 / TLS 错误 | 检查服务器出站网络、域名、证书、系统时间和 CA 包 |
+| HTTP 429 / 5xx | 检查面板或代理运行状态，稍后重试 |
+| OpenRC crond 无法启动 | 检查基础服务及系统日志；某些精简镜像缺失 OpenRC 包文件，可用 `apk fix openrc` 修复 |
+
+更换安装器不会修复后台停用或不存在的机器。鉴权失败发生在下载 Node 和写入服务之前；修正后台配置后重新运行即可。安装后复查失败会显示具体分类并保留已启动服务。
+
+Alpine 会检查 `crond` 的 OpenRC 服务是否存在，缺少时安装 `busybox-openrc`，并在下载 Node 之前确认 cron 可以启动。若镜像删除了 `hostname` 等基础服务文件，安装器给出明确提示，不自动修复 OpenRC 包或更改系统服务依赖。
 
 ## 内存和日志
 

@@ -44,6 +44,15 @@ assert run('parse_command', COMMAND + '\n').stdout.splitlines() == [
     'https://panel.example.com', 'example-machine-token', '8']
 assert run('parse_command', COMMAND.replace('| sudo', '|').replace("'", '"') + '\n').returncode == 0
 assert run('parse_command', COMMAND.replace('--machine-id 8', '--machine-id 42').replace(' --mode', '\t--mode') + '\n').stdout.endswith('42\n')
+installer_url = 'https://raw.githubusercontent.com/cedar2025/xboard-node/dev/install.sh'
+for copied in [
+    COMMAND.replace(installer_url, f'[{installer_url}]({installer_url})'),
+    COMMAND.replace('https://panel.example.com/',
+                    '[https://panel.example.com/](https://panel.example.com/)'),
+    COMMAND.replace(' ', '\u00a0'),
+]:
+    assert run('parse_command', copied + '\n').stdout.splitlines() == [
+        'https://panel.example.com', 'example-machine-token', '8']
 for attack in [
     COMMAND + '; touch /tmp/must-not-exist',
     COMMAND + ' && false', COMMAND + ' | sh', COMMAND + ' --kernel xray',
@@ -62,42 +71,55 @@ for attack in [
     COMMAND.replace('https://panel.example.com/', 'https://panel.example.com/?x=1'),
     COMMAND.replace('https://panel.example.com/', 'https://panel.example.com:99999/'),
     COMMAND.replace('cedar2025/xboard-node', 'attacker/xboard-node'),
+    COMMAND.replace(installer_url, f'[{installer_url}](https://attacker.example/install.sh)'),
+    COMMAND.replace('https://panel.example.com/',
+                    '[https://panel.example.com/](https://attacker.example/)'),
+    COMMAND.replace('https://panel.example.com/', '[panel](https://panel.example.com/)'),
     COMMAND[:-1] + "'", 'x' * 8193, '',
 ]:
     p = run('parse_command', attack + '\n', success=False)
     assert not p.stdout, 'rejected command must not emit private fields'
 
-# A controlling terminal is required even when the installer stdin is a pipe.
-# Paste immediately after the prompt to catch echo-disable ordering regressions.
-pid, terminal = pty.fork()
-if pid == 0:
-    os.execvp(SHELL[0], SHELL + ['-c', BASE +
-              'MEMORY=64; read_private_command </dev/null; choose_options </dev/null; '
-              'printf "PRIVATE_OK:%s:%s\\n" "$MACHINE_ID" "$BUDGET"'])
-output = b''
-sent = False
-deadline = time.monotonic() + 10
-try:
-    while True:
-        assert time.monotonic() < deadline, output
-        readable, _, _ = select.select([terminal], [], [], 0.2)
-        if not readable:
-            continue
-        try:
-            chunk = os.read(terminal, 8192)
-        except OSError:
-            break
-        if not chunk:
-            break
-        output += chunk
-        if not sent and '输入隐藏'.encode() in output:
-            os.write(terminal, (COMMAND + '\n1\n2\n00000028\n').encode())
-            sent = True
-    _, status = os.waitpid(pid, 0)
-    assert status == 0 and b'PRIVATE_OK:8:28' in output, output
-    assert b'example-machine-token' not in output, 'terminal echoed private command'
-finally:
-    os.close(terminal)
+# Paste immediately after the prompt, including queued retries, to catch leaks.
+for pasted_command, valid in [
+    (COMMAND, True),
+    ('invalid example-machine-token\n' + COMMAND.replace(
+        installer_url, f'[{installer_url}]({installer_url})'), True),
+    ('invalid example-machine-token\n' * 2 + 'invalid example-machine-token', False),
+]:
+    pid, terminal = pty.fork()
+    if pid == 0:
+        os.execvp(SHELL[0], SHELL + ['-c', BASE +
+                  'trap cleanup EXIT; MEMORY=64; read_private_command </dev/null; choose_options </dev/null; '
+                  'printf "PRIVATE_OK:%s:%s\\n" "$MACHINE_ID" "$BUDGET"'])
+    output = b''
+    sent = False
+    deadline = time.monotonic() + 10
+    try:
+        while True:
+            assert time.monotonic() < deadline, output
+            readable, _, _ = select.select([terminal], [], [], 0.2)
+            if not readable:
+                continue
+            try:
+                chunk = os.read(terminal, 8192)
+            except OSError:
+                break
+            if not chunk:
+                break
+            output += chunk
+            if not sent and '输入隐藏'.encode() in output:
+                suffix = '\n1\n2\n00000028\n' if valid else '\n'
+                os.write(terminal, (pasted_command + suffix).encode())
+                sent = True
+        _, status = os.waitpid(pid, 0)
+        if valid:
+            assert status == 0 and b'PRIVATE_OK:8:28' in output, output
+        else:
+            assert status != 0 and '连续三次输入无效'.encode() in output, output
+        assert b'example-machine-token' not in output, 'terminal echoed private command'
+    finally:
+        os.close(terminal)
 
 with tempfile.TemporaryDirectory(prefix='xboard-check-') as temp:
     root = Path(temp)
@@ -133,6 +155,35 @@ with tempfile.TemporaryDirectory(prefix='xboard-check-') as temp:
     # Private JSON auth is stdin; curl argv never receives the token or redirects.
     stage = root / 'stage'
     stage.mkdir()
+    # Minimal Alpine images can have crond but no OpenRC service for it.
+    mockbin = root / 'mockbin'
+    mockbin.mkdir()
+    (mockbin / 'rc-service').write_text('#!/bin/sh\ntest -e "$STAGE/cron-ready"\n')
+    (mockbin / 'apk').write_text(
+        '#!/bin/sh\nprintf "%s\\n" "$@" >"$STAGE/apk-argv"\n: >"$STAGE/cron-ready"\n')
+    for path in mockbin.iterdir():
+        path.chmod(0o755)
+    dependency_probe = (f'STAGE={shlex.quote(str(stage))}; export STAGE; INIT=openrc; '
+                        f'PATH={shlex.quote(str(mockbin))}:$PATH; '
+                        'command() { return 0; }; install_dependencies')
+    run(dependency_probe)
+    assert 'busybox-openrc' in (stage / 'apk-argv').read_text().splitlines()
+    (mockbin / 'rc-update').write_text('#!/bin/sh\nexit 0\n')
+    (mockbin / 'rc-update').chmod(0o755)
+    (mockbin / 'rc-service').write_text('#!/bin/sh\nexit 1\n')
+    p = run(f'PATH={shlex.quote(str(mockbin))}:$PATH; '
+            f'LOCK={shlex.quote(str(root / "cron-lock"))}; '
+            f'mktemp() {{ printf "%s\\n" {shlex.quote(str(stage))}; }}; '
+            'id() { echo 0; }; check_existing() { return 1; }; '
+            'detect_platform() { INIT=openrc; }; read_private_command() { :; }; '
+            'choose_options() { :; }; install_dependencies() { :; }; '
+            'check_panel() { NODE_COUNT=0; }; '
+            f'download_binaries() {{ touch {shlex.quote(str(root / "download-called"))}; }}; main',
+            success=False)
+    assert 'OpenRC crond 服务无法启动' in p.stderr
+    assert not (root / 'download-called').exists()
+    assert not (root / 'cron-lock').exists()
+
     common = f'STAGE={shlex.quote(str(stage))}; PANEL=https://panel.example.com; TOKEN=example-machine-token; MACHINE_ID=8; '
     fake_curl = '''curl() {
         printf '%s\\n' "$@" >"$STAGE/argv";
@@ -155,6 +206,33 @@ with tempfile.TemporaryDirectory(prefix='xboard-check-') as temp:
         assert '--location' not in (stage / 'argv').read_text()
         assert 'example-machine-token' not in p.stdout + p.stderr
         assert (stage / 'body').read_text() == '{"machine_id":8,"token":"example-machine-token"}'
+
+    # Errors are actionable fixed text; never echo a panel-supplied message.
+    for response, http_status, curl_exit, expected in [
+        ('{"message":"Machine not found or disabled"}', '403', 0, '机器不存在或已停用'),
+        ('{"message":"example-machine-token https://panel.example.com"}', '403', 0, '接入被拒绝'),
+        ('{}', '401', 0, '鉴权未通过'),
+        ('{}', '404', 0, '找不到机器 API'),
+        ('<html>login</html>', '302', 0, '重定向'),
+        ('{}', '429', 0, '请求过于频繁'),
+        ('{}', '503', 0, '面板或代理服务异常'),
+        ('<html>login example-machine-token</html>', '200', 0, '返回格式不符'),
+        ('{}', '000', 6, 'DNS'),
+        ('{}', '000', 7, '无法连接'),
+        ('{}', '000', 28, '超时'),
+        ('{}', '000', 60, 'TLS'),
+        ('{}', '000', 63, '响应超过'),
+        ('{}', '000', 52, '网络请求失败'),
+    ]:
+        code = common + fake_curl.replace('printf \'%s\' "$http_status";',
+                                          f'printf \'%s\' "$http_status"; return {curl_exit};')
+        code += (f'response={shlex.quote(response)}; http_status={http_status}; '
+                 'if check_panel; then exit 99; fi; printf "%s\\n" "$PANEL_ERROR"; '
+                 'test ! -e "$STAGE/panel.json"')
+        p = run(code)
+        assert expected in p.stdout, p.stdout
+        assert 'example-machine-token' not in p.stdout + p.stderr
+        assert 'https://panel.example.com' not in p.stdout + p.stderr
 
     def service_setup(init):
         for name in ('log', 'config'):

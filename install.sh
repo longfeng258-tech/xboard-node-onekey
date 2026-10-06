@@ -32,9 +32,19 @@ parse_command() {
     # Shell expansion, escaping, redirection and extra commands are unsupported.
     awk '
     function bad() { exit 1 }
+    function link_url(value, end_label, label, target) {
+        if (substr(value,1,1) != "[") return value
+        end_label=index(value,"](")
+        if (!end_label || substr(value,length(value),1) != ")") bad()
+        label=substr(value,2,end_label-2)
+        target=substr(value,end_label+2,length(value)-end_label-2)
+        if (label != target) bad()
+        return target
+    }
     { if (NR != 1 || length($0) > 8192) bad(); line=$0 }
     END {
         if (NR != 1 || line ~ /[$`\\;&<>\r]/) bad()
+        gsub(/\302\240/," ",line)
         quote=""; word=""; n=0; started=0
         for (i=1; i<=length(line); i++) {
             c=substr(line,i,1)
@@ -51,14 +61,14 @@ parse_command() {
         if (quote != "") bad()
         if (started) a[++n]=word
         if (a[1] != "curl" || a[2] != "-fsSL" ||
-            tolower(a[3]) != "https://raw.githubusercontent.com/cedar2025/xboard-node/dev/install.sh" || a[4] != "|") bad()
+            tolower(link_url(a[3])) != "https://raw.githubusercontent.com/cedar2025/xboard-node/dev/install.sh" || a[4] != "|") bad()
         p=5; if (a[p] == "sudo") p++
         if (a[p++] != "bash" || a[p++] != "-s" || a[p++] != "--") bad()
         while (p<=n) {
             key=a[p++]; value=a[p++]
             if (seen[key]++ || value == "") bad()
             if (key == "--mode") mode=value
-            else if (key == "--panel") panel=value
+            else if (key == "--panel") panel=link_url(value)
             else if (key == "--token") token=value
             else if (key == "--machine-id") id=value
             else bad()
@@ -174,12 +184,18 @@ read_private_command() {
     exec 3<>/dev/tty || die '需要交互终端；请在服务器控制台运行。'
     TTY_STATE=$(stty -g <&3) || die '无法设置终端。'
     stty -echo <&3
-    say '粘贴面板后台的完整 machine 安装命令，然后回车（输入隐藏）：' >&3
-    IFS= read -r pasted <&3 || die '没有读取到安装命令。'
+    parsed=
+    for attempt in 1 2 3; do
+        say '粘贴面板后台的完整 machine 安装命令，然后回车（输入隐藏）：' >&3
+        IFS= read -r pasted <&3 || die '没有读取到安装命令。'
+        printf '\n' >&3
+        if parsed=$(printf '%s\n' "$pasted" | parse_command); then break; fi
+        unset pasted
+        say '命令格式无效：请复制完整 machine 命令，包含面板地址、Token 和机器 ID；网址链接的显示文本与目标必须一致。' >&3
+        [ "$attempt" != 3 ] || die '连续三次输入无效；请从面板后台重新复制完整安装命令后重试。'
+    done
     stty "$TTY_STATE" <&3
     TTY_STATE=
-    printf '\n' >&3
-    parsed=$(printf '%s\n' "$pasted" | parse_command) || die '命令格式不支持或参数无效；只接受后台原样复制的完整 machine 命令。'
     unset pasted
     PANEL=$(printf '%s\n' "$parsed" | sed -n '1p')
     TOKEN=$(printf '%s\n' "$parsed" | sed -n '2p')
@@ -215,10 +231,15 @@ install_dependencies() {
         command -v "$cmd" >/dev/null 2>&1 || missing=1
     done
     [ -s /etc/ssl/certs/ca-certificates.crt ] || missing=1
+    if [ "$INIT" = openrc ]; then
+        rc-service --exists crond >/dev/null 2>&1 || missing=1
+    fi
     [ -n "$missing" ] || return 0
     say '安装缺少的下载、JSON 校验、证书和日志轮转工具……'
     if [ "$INIT" = openrc ]; then
-        apk add --no-cache curl ca-certificates jq logrotate >/dev/null 2>&1 || die '依赖安装失败，请检查 apk 软件源和可用资源。'
+        set -- curl ca-certificates jq logrotate
+        if ! rc-service --exists crond >/dev/null 2>&1; then set -- "$@" busybox-openrc; fi
+        apk add --no-cache "$@" >/dev/null 2>&1 || die '依赖安装失败，请检查 apk 软件源和可用资源。'
     else
         apt-get -o Acquire::Languages=none update -qq >/dev/null 2>&1 || die 'apt 软件源更新失败。'
         DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends curl ca-certificates jq logrotate >/dev/null 2>&1 || die '依赖安装失败，请检查 apt 软件源和可用资源。'
@@ -226,24 +247,57 @@ install_dependencies() {
     for cmd in curl jq sha256sum logrotate; do
         command -v "$cmd" >/dev/null 2>&1 || die '安装后仍缺少必要工具。'
     done
+    if [ "$INIT" = openrc ]; then
+        rc-service --exists crond >/dev/null 2>&1 || die '缺少 crond 的 OpenRC 服务；请检查 busybox-openrc 软件包。'
+    fi
 }
 
 check_panel() {
     # Secret stays in stdin, not argv/env/URL. No redirect and no error body echo.
-    status=$(printf '{"machine_id":%s,"token":"%s"}' "$MACHINE_ID" "$TOKEN" |
+    PANEL_ERROR=
+    NODE_COUNT=0
+    if status=$(printf '{"machine_id":%s,"token":"%s"}' "$MACHINE_ID" "$TOKEN" |
         curl -q --silent --proto '=https' --connect-timeout 10 --max-time 30 \
         --max-filesize 1048576 --request POST --header 'Content-Type: application/json' \
         --header 'Accept: application/json' --data-binary @- \
         --output "$STAGE/panel.json" --write-out '%{http_code}' \
-        "$PANEL/api/v2/server/machine/nodes" 2>/dev/null) || return 1
-    [ "$status" = 200 ] || return 1
-    NODE_COUNT=$(jq -er '
+        "$PANEL/api/v2/server/machine/nodes" 2>/dev/null); then
+        case "$status" in
+            200) ;;
+            403)
+                if jq -e 'type == "object" and .message == "Machine not found or disabled"' "$STAGE/panel.json" >/dev/null 2>&1; then
+                    PANEL_ERROR='面板拒绝接入（HTTP 403）：机器不存在或已停用；请在后台确认机器 ID 和启用状态，再重新复制安装命令。'
+                else
+                    PANEL_ERROR='面板接入被拒绝（HTTP 403）；请核对机器启用状态、Token 和面板访问限制。'
+                fi ;;
+            401) PANEL_ERROR='面板鉴权未通过（HTTP 401）；请从后台重新复制当前机器的安装命令。' ;;
+            404) PANEL_ERROR='找不到机器 API（HTTP 404）；请核对面板地址和面板版本是否支持 machine 模式。' ;;
+            3[0-9][0-9]) PANEL_ERROR="面板接口发生重定向（HTTP $status）；请核对最终 HTTPS 地址及面板登录跳转。" ;;
+            429) PANEL_ERROR='面板请求过于频繁（HTTP 429）；请稍后重试并检查面板访问限制。' ;;
+            5[0-9][0-9]) PANEL_ERROR="面板或代理服务异常（HTTP $status）；请检查面板运行状态后重试。" ;;
+            [0-9][0-9][0-9]) PANEL_ERROR="面板返回非预期状态（HTTP $status）；请检查面板机器接口。" ;;
+            *) PANEL_ERROR='无法识别面板 HTTP 状态；请检查网络和面板机器接口。' ;;
+        esac
+    else
+        case "$?" in
+            5|6) PANEL_ERROR='面板 DNS 解析失败；请检查域名和服务器 DNS。' ;;
+            7) PANEL_ERROR='无法连接面板；请检查面板运行状态和服务器出站网络。' ;;
+            28) PANEL_ERROR='面板请求超时；请检查网络和面板运行状态后重试。' ;;
+            35|51|58|60|77) PANEL_ERROR='面板 HTTPS/TLS 校验失败；请检查证书、系统时间和 CA 证书包。' ;;
+            63) PANEL_ERROR='面板响应超过 1MiB 限制；请检查机器接口是否返回了异常页面或过大的配置。' ;;
+            *) PANEL_ERROR='面板网络请求失败；请检查网络、HTTPS 和面板运行状态。' ;;
+        esac
+    fi
+    if [ -z "$PANEL_ERROR" ]; then
+        NODE_COUNT=$(jq -er '
         if type == "object" and (.nodes | type == "array") and
            all(.nodes[]; type == "object" and (.id | type == "number") and
                (.id > 0) and (.id == (.id | floor)) and (.type | type == "string"))
         then .nodes | length else error("invalid machine response") end
-        ' "$STAGE/panel.json" 2>/dev/null) || return 1
+        ' "$STAGE/panel.json" 2>/dev/null) || PANEL_ERROR='面板返回格式不符；需要 machine API 的 JSON 节点列表，请检查面板版本、地址和登录跳转。'
+    fi
     rm -f "$STAGE/panel.json"
+    [ -z "$PANEL_ERROR" ]
 }
 
 download_binaries() {
@@ -386,8 +440,6 @@ start_services() {
         systemctl daemon-reload >/dev/null 2>&1 &&
         systemctl enable --now xboard-node-logrotate.timer xboard-node.service >/dev/null 2>&1 || return 1
     else
-        rc-update add crond default >/dev/null 2>&1 &&
-        rc-service crond start >/dev/null 2>&1 &&
         rc-update add xboard-node default >/dev/null 2>&1 &&
         rc-service xboard-node start >/dev/null 2>&1 || return 1
     fi
@@ -447,8 +499,13 @@ main() {
     disk_kib=$(df -Pk /usr/local/lib | awk 'END {print $4}')
     [ "$disk_kib" -ge 102400 ] || die '安装依赖后磁盘不足 100MiB。'
     STAGE=$(mktemp -d /usr/local/lib/.xboard-node.XXXXXX) || die '无法创建磁盘暂存目录。'
-    check_panel || die '面板机器鉴权失败或返回格式不符；请检查 HTTPS、后台命令和机器配置。'
+    check_panel || die "$PANEL_ERROR"
     say "面板机器鉴权通过；已分配节点数：$NODE_COUNT（不显示接入地址或凭据）。"
+    if [ "$INIT" = openrc ]; then
+        rc-update add crond default >/dev/null 2>&1 &&
+        rc-service crond start >/dev/null 2>&1 ||
+            die 'OpenRC crond 服务无法启动；请检查 hostname、logger 等基础服务及系统日志。精简镜像缺失包文件时可用 apk fix openrc 修复，脚本不会自动修复系统服务。'
+    fi
     download_binaries
     generate_config
     if check_existing; then die '安装期间出现已有安装，停止写入。'; fi
@@ -465,6 +522,7 @@ main() {
     say "安装完成：官方 $VERSION / $ARCH / $KERNEL；服务已启动并设为开机启动。"
     if [ "$panel_ok" = 0 ]; then
         say '安装前面板鉴权通过，但安装后复查失败；服务保留，请在面板确认接入状态。'
+        say "$PANEL_ERROR"
     elif [ "$NODE_COUNT" = 0 ]; then
         say '面板暂未分配节点；Node 等待后台添加，无需重装。'
     else
