@@ -23,9 +23,18 @@ OWNED=0
 LOCKED=0
 COMPLETE=0
 TTY_STATE=
+PHASE=初始化
+DIAG_LOG=
+FAILURE_REPORTED=0
 
 say() { printf '%s\n' "$*"; }
-die() { say "错误：$*" >&2; exit 1; }
+die() { FAILURE_REPORTED=1; say "错误：$*" >&2; exit 1; }
+phase() {
+    PHASE=$1
+    say "==> $PHASE"
+    [ -z "$DIAG_LOG" ] || printf '\n==> %s\n' "$PHASE" >>"$DIAG_LOG"
+}
+run_logged() { "$@" </dev/null >>"${DIAG_LOG:-/dev/null}" 2>&1; }
 
 parse_command() {
     # A small, deliberately restricted lexer for the backend's one-line format.
@@ -239,10 +248,10 @@ install_dependencies() {
     if [ "$INIT" = openrc ]; then
         set -- curl ca-certificates jq logrotate
         if ! rc-service --exists crond >/dev/null 2>&1; then set -- "$@" busybox-openrc; fi
-        apk add --no-cache "$@" >/dev/null 2>&1 || die '依赖安装失败，请检查 apk 软件源和可用资源。'
+        run_logged apk add --no-cache "$@" || die '依赖安装失败，请检查 apk 软件源和可用资源。'
     else
-        apt-get -o Acquire::Languages=none update -qq >/dev/null 2>&1 || die 'apt 软件源更新失败。'
-        DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends curl ca-certificates jq logrotate >/dev/null 2>&1 || die '依赖安装失败，请检查 apt 软件源和可用资源。'
+        run_logged apt-get -o Acquire::Languages=none update -qq || die 'apt 软件源更新失败。'
+        run_logged env DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends curl ca-certificates jq logrotate || die '依赖安装失败，请检查 apt 软件源和可用资源。'
     fi
     for cmd in curl jq sha256sum logrotate; do
         command -v "$cmd" >/dev/null 2>&1 || die '安装后仍缺少必要工具。'
@@ -250,6 +259,21 @@ install_dependencies() {
     if [ "$INIT" = openrc ]; then
         rc-service --exists crond >/dev/null 2>&1 || die '缺少 crond 的 OpenRC 服务；请检查 busybox-openrc 软件包。'
     fi
+}
+
+prepare_openrc_cron() {
+    # Only restore a missing service which the installed package claims to own.
+    # apk fix reinstalls the installed version and preserves edited config files.
+    if ! rc-service --exists hostname >/dev/null 2>&1 &&
+        apk info -L openrc 2>/dev/null | grep -Eq '^/?etc/init.d/hostname$'; then
+        say '发现 OpenRC 包缺失 hostname 服务文件；恢复已安装包的文件，保留现有配置。'
+        run_logged apk fix --no-cache openrc || die 'OpenRC 包文件恢复失败；请检查 apk 软件源，或联系镜像提供方。'
+        rc-service --exists hostname >/dev/null 2>&1 || die '恢复后仍缺少 hostname 服务；请检查镜像或 OpenRC 包完整性。'
+    fi
+    run_logged rc-update add crond default &&
+        run_logged rc-service crond start ||
+        die 'OpenRC crond 服务无法启动；请检查私有诊断日志中的依赖错误，以及镜像基础服务是否完整。'
+    say 'OpenRC crond 检查通过。'
 }
 
 check_panel() {
@@ -437,11 +461,11 @@ EOF
 
 start_services() {
     if [ "$INIT" = systemd ]; then
-        systemctl daemon-reload >/dev/null 2>&1 &&
-        systemctl enable --now xboard-node-logrotate.timer xboard-node.service >/dev/null 2>&1 || return 1
+        run_logged systemctl daemon-reload &&
+        run_logged systemctl enable --now xboard-node-logrotate.timer xboard-node.service || return 1
     else
-        rc-update add xboard-node default >/dev/null 2>&1 &&
-        rc-service xboard-node start >/dev/null 2>&1 || return 1
+        run_logged rc-update add xboard-node default &&
+        run_logged rc-service xboard-node start || return 1
     fi
     # Require stable process identity, not a transient active/restart state.
     old_pid=
@@ -465,6 +489,18 @@ start_services() {
 cleanup() {
     result=$?
     trap - EXIT HUP INT TERM
+    set +e
+    if [ "$LOCKED" = 1 ] && [ "$COMPLETE" != 1 ] && [ "$result" = 0 ]; then result=1; fi
+    if [ "$result" != 0 ]; then
+        [ "$FAILURE_REPORTED" = 1 ] || say '错误：安装意外停止，尚未完成。' >&2
+        say "失败阶段：$PHASE；退出码：$result。" >&2
+        if [ -n "$DIAG_LOG" ]; then
+            say "私有诊断日志：$DIAG_LOG（仅 root 可读，分享前必须脱敏）。" >&2
+            if [ "$OWNED" = 1 ] && [ -f "$LOG_DIR/node.log" ]; then
+                tail -c 65536 "$LOG_DIR/node.log" >>"$DIAG_LOG" 2>/dev/null
+            fi
+        fi
+    fi
     [ -z "$TTY_STATE" ] || stty "$TTY_STATE" <&3 2>/dev/null || :
     if [ "$OWNED" = 1 ] && [ "$COMPLETE" != 1 ]; then
         say '首装未完成，清理本次新增的 Node 文件；依赖包保留。' >&2
@@ -480,6 +516,7 @@ cleanup() {
     fi
     case "$STAGE" in /usr/local/lib/.xboard-node.*) rm -rf "$STAGE" ;; esac
     [ "$LOCKED" != 1 ] || rmdir "$LOCK" 2>/dev/null || :
+    if [ "$result" = 0 ] && [ "$COMPLETE" = 1 ] && [ -n "$DIAG_LOG" ]; then rm -f "$DIAG_LOG"; fi
     exit "$result"
 }
 
@@ -492,31 +529,41 @@ main() {
     trap cleanup EXIT
     trap 'exit 130' INT
     trap 'exit 143' HUP TERM
+    DIAG_LOG=$(mktemp /var/log/xboard-node-install.XXXXXX) || die '无法创建私有诊断日志。'
+    chmod 600 "$DIAG_LOG" || die '无法保护诊断日志权限。'
+    phase '检查系统、资源和已有安装'
     detect_platform
+    phase '导入面板后台命令（输入隐藏）'
     read_private_command
+    phase '选择内核和内存预算'
     choose_options
+    phase '检查并安装依赖'
     install_dependencies
     disk_kib=$(df -Pk /usr/local/lib | awk 'END {print $4}')
     [ "$disk_kib" -ge 102400 ] || die '安装依赖后磁盘不足 100MiB。'
     STAGE=$(mktemp -d /usr/local/lib/.xboard-node.XXXXXX) || die '无法创建磁盘暂存目录。'
+    phase '检查面板机器鉴权'
     check_panel || die "$PANEL_ERROR"
-    say "面板机器鉴权通过；已分配节点数：$NODE_COUNT（不显示接入地址或凭据）。"
+    say "面板机器鉴权通过；已分配节点数：$NODE_COUNT。继续安装，这一步不代表安装完成。"
     if [ "$INIT" = openrc ]; then
-        rc-update add crond default >/dev/null 2>&1 &&
-        rc-service crond start >/dev/null 2>&1 ||
-            die 'OpenRC crond 服务无法启动；请检查 hostname、logger 等基础服务及系统日志。精简镜像缺失包文件时可用 apk fix openrc 修复，脚本不会自动修复系统服务。'
+        phase '检查 OpenRC 日志轮转服务'
+        prepare_openrc_cron
     fi
+    phase '下载并校验官方程序'
     download_binaries
+    phase '生成私有配置'
     generate_config
     if check_existing; then die '安装期间出现已有安装，停止写入。'; fi
     OWNED=1
     mv "$STAGE/bin" "$BIN_DIR"
     mv "$STAGE/config" "$CONFIG_DIR"
     chmod 700 "$CONFIG_DIR"
+    phase '配置并启动 Node 服务'
     write_services
     chmod 700 "$LOG_DIR"
     start_services || die '服务启动或稳定性检查失败；请检查系统资源及服务管理器。'
     COMPLETE=1
+    phase '复查面板接入状态'
     if check_panel; then panel_ok=1; else panel_ok=0; fi
     unset TOKEN
     say "安装完成：官方 $VERSION / $ARCH / $KERNEL；服务已启动并设为开机启动。"

@@ -173,7 +173,8 @@ with tempfile.TemporaryDirectory(prefix='xboard-check-') as temp:
     (mockbin / 'rc-service').write_text('#!/bin/sh\nexit 1\n')
     p = run(f'PATH={shlex.quote(str(mockbin))}:$PATH; '
             f'LOCK={shlex.quote(str(root / "cron-lock"))}; '
-            f'mktemp() {{ printf "%s\\n" {shlex.quote(str(stage))}; }}; '
+            f'mktemp() {{ case "$1" in -d) echo {shlex.quote(str(stage))};; '
+            f'*) touch {shlex.quote(str(root / "cron-diagnostic"))}; echo {shlex.quote(str(root / "cron-diagnostic"))};; esac; }}; '
             'id() { echo 0; }; check_existing() { return 1; }; '
             'detect_platform() { INIT=openrc; }; read_private_command() { :; }; '
             'choose_options() { :; }; install_dependencies() { :; }; '
@@ -183,6 +184,64 @@ with tempfile.TemporaryDirectory(prefix='xboard-check-') as temp:
     assert 'OpenRC crond 服务无法启动' in p.stderr
     assert not (root / 'download-called').exists()
     assert not (root / 'cron-lock').exists()
+
+    # Exercise main end-to-end: a stripped Alpine image must recover its packaged
+    # hostname service, reach completion, and explain otherwise silent failures.
+    flowbin = root / 'flowbin'
+    flowbin.mkdir()
+    (flowbin / 'rc-service').write_text('''#!/bin/sh
+case "$*" in
+  '--exists hostname') test -e "$FLOW/hostname-ready";;
+  '--exists crond') exit 0;;
+  'crond start') test -e "$FLOW/hostname-ready" && test "$FLOW_MODE" != cron-fail;;
+  *) exit 0;;
+esac
+''')
+    (flowbin / 'rc-update').write_text('#!/bin/sh\nexit 0\n')
+    (flowbin / 'apk').write_text('''#!/bin/sh
+case "$*" in
+  'info -L openrc') test "$FLOW_MODE" = unknown-owner || echo etc/init.d/hostname;;
+  'fix --no-cache openrc')
+    echo repair >>"$FLOW/repairs"
+    test "$FLOW_MODE" = repair-fail || : >"$FLOW/hostname-ready";;
+  *) exit 0;;
+esac
+''')
+    for path in flowbin.iterdir():
+        path.chmod(0o755)
+    for mode in ('repair', 'healthy', 'repair-fail', 'unknown-owner', 'cron-fail', 'unexpected'):
+        flow = root / mode
+        flow.mkdir()
+        if mode in ('healthy', 'cron-fail', 'unexpected'):
+            (flow / 'hostname-ready').touch()
+        fields = dict(FLOW=flow, FLOW_MODE=mode, LOCK=flow / 'lock',
+                      BIN_DIR=flow / 'bin', CONFIG_DIR=flow / 'config', LOG_DIR=flow / 'logs')
+        code = '; '.join(f'{key}={shlex.quote(str(value))}' for key, value in fields.items()) + '; '
+        code += (f'export FLOW FLOW_MODE; PATH={shlex.quote(str(flowbin))}:$PATH; '
+                 'id() { echo 0; }; check_existing() { return 1; }; '
+                 'detect_platform() { INIT=openrc; ARCH=arm64; }; read_private_command() { TOKEN=example-machine-token; }; '
+                 'choose_options() { KERNEL=singbox; }; install_dependencies() { :; }; '
+                 'check_panel() { NODE_COUNT=0; }; '
+                 'mktemp() { case "$1" in -d) mkdir "$FLOW/stage"; echo "$FLOW/stage";; '
+                 '*) : >"$FLOW/diagnostic.log"; echo "$FLOW/diagnostic.log";; esac; }; '
+                 'download_binaries() { test "$FLOW_MODE" != unexpected; '
+                 'mkdir "$STAGE/bin" "$STAGE/config"; }; '
+                 'generate_config() { :; }; write_services() { mkdir "$LOG_DIR"; }; '
+                 'start_services() { :; }; main')
+        valid = mode in ('repair', 'healthy')
+        p = run(code, success=valid)
+        output = p.stdout + p.stderr
+        if valid:
+            assert '安装完成' in output and '无需重装' in output, output
+            assert not (flow / 'diagnostic.log').exists()
+        else:
+            assert '失败阶段' in output and '退出码' in output, output
+            assert (flow / 'diagnostic.log').stat().st_mode & 0o777 == 0o600
+            if mode == 'unexpected':
+                assert '意外停止' in output and '下载' in output, output
+        assert (flow / 'repairs').exists() == (mode in ('repair', 'repair-fail'))
+        assert not (flow / 'lock').exists()
+        assert 'example-machine-token' not in output
 
     common = f'STAGE={shlex.quote(str(stage))}; PANEL=https://panel.example.com; TOKEN=example-machine-token; MACHINE_ID=8; '
     fake_curl = '''curl() {
@@ -285,10 +344,17 @@ with tempfile.TemporaryDirectory(prefix='xboard-check-') as temp:
     # Failed-first-install cleanup is scoped to freshly owned files.
     preserve = root / 'unrelated'
     preserve.write_text('keep')
-    run(service_setup('systemd') + f'LOCK={shlex.quote(str(lock))}; LOCKED=1; OWNED=1; '
-        'systemctl() { :; }; cleanup')
+    (root / 'log/node.log').write_text('x' * 70000 + '\nexample-machine-token private startup failure\n')
+    diagnostic = root / 'retained-diagnostic'
+    p = run(service_setup('systemd') + f'LOCK={shlex.quote(str(lock))}; LOCKED=1; OWNED=1; '
+            f'DIAG_LOG={shlex.quote(str(diagnostic))}; : >"$DIAG_LOG"; '
+            'systemctl() { :; }; cleanup', success=False)
     assert preserve.read_text() == 'keep'
     assert not (root / 'config').exists() and not lock.exists()
+    assert diagnostic.stat().st_mode & 0o777 == 0o600
+    assert diagnostic.stat().st_size == 65536
+    assert diagnostic.read_text().endswith('private startup failure\n')
+    assert 'example-machine-token' not in p.stdout + p.stderr
 
     # Real pinned xbctl + Node smoke check is optional and stays in this temp tree.
     binaries = os.environ.get('XBOARD_TEST_BINARIES')
