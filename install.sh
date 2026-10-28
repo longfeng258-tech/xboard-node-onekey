@@ -167,7 +167,10 @@ detect_platform() {
     esac
     # os-release is a root-owned OS file, never operator input.
     [ -r /etc/os-release ] || die '无法识别发行版。'
+    # os-release also defines VERSION (e.g. Ubuntu); keep the installer's release tag.
+    NODE_VERSION=$VERSION
     . /etc/os-release
+    VERSION=$NODE_VERSION
     case "$ID" in
         debian|ubuntu)
             [ -d /run/systemd/system ] && command -v systemctl >/dev/null 2>&1 || die '需要正在运行的 systemd。'
